@@ -29,7 +29,7 @@
   const main = $('#main');
 
   /* ---------- storage ---------- */
-  function blank() { return { v: 1, goal: 24, books: [] }; }
+  function blank() { return { v: 1, goal: 24, goalU: 0, books: [], tomb: {} }; }
   function load() {
     try {
       const s = JSON.parse(localStorage.getItem(KEY));
@@ -38,7 +38,8 @@
     return blank();
   }
   function normalize(s) {
-    const out = { v: 1, goal: Math.max(1, parseInt(s.goal, 10) || 24), books: [] };
+    const out = { v: 1, goal: Math.max(1, parseInt(s.goal, 10) || 24), goalU: +s.goalU || 0, books: [], tomb: {} };
+    if (s.tomb && typeof s.tomb === 'object') for (const k in s.tomb) if (+s.tomb[k] > 0) out.tomb[String(k)] = +s.tomb[k];
     for (const b of s.books) {
       if (!b || typeof b.title !== 'string') continue;
       const pages = Math.max(1, parseInt(b.pages, 10) || 1);
@@ -53,18 +54,169 @@
         sessions: (Array.isArray(b.sessions) ? b.sessions : []).filter(x => x && isDate(x.d) && x.p > 0).map(x => ({ d: x.d, p: Math.round(x.p) })),
         notes: (Array.isArray(b.notes) ? b.notes : []).filter(x => x && typeof x.text === 'string').map(x => ({
           id: String(x.id || uid()), text: x.text.slice(0, 5000), page: x.page == null || x.page === '' ? null : parseInt(x.page, 10) || null,
-          at: isDate(x.at) ? x.at : today()
+          at: isDate(x.at) ? x.at : today(), u: +x.u || 0
         })),
-        added: isDate(b.added) ? b.added : today(), example: !!b.example
+        added: isDate(b.added) ? b.added : today(), example: !!b.example, u: +b.u || 0
       });
     }
     return out;
   }
   let state = load();
-  function save() {
+
+  /* Change tracking for sync: every book and note carries `u` (last changed, ms).
+     Deleted ids go into state.tomb so a deletion on one device wins over an older copy elsewhere. */
+  const bookKey = b => { const { u, notes, ...rest } = b; return JSON.stringify(rest); };
+  const noteKey = n => { const { u, ...rest } = n; return JSON.stringify(rest); };
+  let snap = { books: {}, notes: {}, goal: state.goal };
+  function stamp(init) {
+    const now = Date.now(), next = { books: {}, notes: {}, goal: state.goal };
+    for (const b of state.books) {
+      const k = bookKey(b); next.books[b.id] = k;
+      if (!b.u || (!init && snap.books[b.id] !== k)) b.u = now;
+      delete state.tomb[b.id];
+      for (const n of b.notes) {
+        const nk = noteKey(n); next.notes[n.id] = nk;
+        if (!n.u || (!init && snap.notes[n.id] !== nk)) n.u = now;
+        delete state.tomb[n.id];
+      }
+    }
+    if (!init) {
+      for (const id in snap.books) if (!(id in next.books)) state.tomb[id] = now;
+      for (const id in snap.notes) if (!(id in next.notes)) state.tomb[id] = now;
+      if (snap.goal !== state.goal) state.goalU = now;
+    }
+    snap = next;
+  }
+  stamp(true);
+  function persist() {
     try { localStorage.setItem(KEY, JSON.stringify(state)); }
     catch (e) { toast("Couldn't save. Your browser is blocking storage for this page."); }
   }
+  function save() { stamp(false); persist(); scheduleSync(); }
+
+  /* Merge two libraries: newest version of each book wins, notes merge one by one,
+     reading sessions from both sides are kept, and deletions win over older copies. */
+  function merge(L, R) {
+    const tomb = { ...R.tomb };
+    for (const k in L.tomb) tomb[k] = Math.max(tomb[k] || 0, L.tomb[k]);
+    const goalSide = (L.goalU || 0) >= (R.goalU || 0) ? L : R;
+    const rMap = new Map(R.books.map(b => [b.id, b])), lMap = new Map(L.books.map(b => [b.id, b]));
+    const ids = [...L.books.map(b => b.id), ...R.books.filter(b => !lMap.has(b.id)).map(b => b.id)];
+    const books = [];
+    for (const id of ids) {
+      const l = lMap.get(id), r = rMap.get(id);
+      const base = !r ? l : !l ? r : (l.u || 0) >= (r.u || 0) ? l : r, other = base === l ? r : l;
+      if (tomb[id] && tomb[id] >= (base.u || 0)) continue;
+      const b = JSON.parse(JSON.stringify(base));
+      if (other) {
+        const notes = new Map();
+        for (const n of [...other.notes, ...b.notes]) { const cur = notes.get(n.id); if (!cur || (n.u || 0) >= (cur.u || 0)) notes.set(n.id, n); }
+        b.notes = [...notes.values()].map(n => ({ ...n }));
+        const ses = new Map(other.sessions.map(s => [s.d, s.p]));
+        b.sessions.forEach(s => ses.set(s.d, s.p));
+        b.sessions = [...ses.entries()].map(([d, p]) => ({ d, p })).sort((x, y) => x.d.localeCompare(y.d));
+      }
+      b.notes = b.notes.filter(n => !(tomb[n.id] && tomb[n.id] >= (n.u || 0)));
+      books.push(b);
+    }
+    const cutoff = Date.now() - 180 * 864e5;
+    for (const k in tomb) if (tomb[k] < cutoff) delete tomb[k];
+    return { v: 1, goal: goalSide.goal, goalU: goalSide.goalU || 0, books, tomb };
+  }
+
+  /* ---------- GitHub Gist sync ---------- */
+  const SKEY = 'shelf-life:sync', FILE = 'shelf-life.json', API = 'https://api.github.com';
+  let sync = (() => { try { return JSON.parse(localStorage.getItem(SKEY)) || {}; } catch (e) { return {}; } })();
+  const saveSync = () => { try { localStorage.setItem(SKEY, JSON.stringify(sync)); } catch (e) { /* ignore */ } };
+  const syncRt = { busy: false, again: false, timer: null, status: sync.token ? 'idle' : 'off', msg: '' };
+  async function gh(path, opts = {}) {
+    const r = await fetch(API + path, {
+      ...opts, cache: 'no-store',
+      headers: { Accept: 'application/vnd.github+json', Authorization: 'Bearer ' + sync.token, 'X-GitHub-Api-Version': '2022-11-28', ...(opts.body ? { 'Content-Type': 'application/json' } : {}) }
+    });
+    if (!r.ok) { const e = new Error('GitHub ' + r.status); e.status = r.status; throw e; }
+    return r.status === 204 ? null : r.json();
+  }
+  async function findOrCreateGist() {
+    for (let p = 1; p <= 5; p++) {
+      const list = await gh(`/gists?per_page=100&page=${p}`);
+      const g = list.find(x => x.files && x.files[FILE]);
+      if (g) return g.id;
+      if (list.length < 100) break;
+    }
+    const g = await gh('/gists', { method: 'POST', body: JSON.stringify({ description: 'Shelf Life library (kept in sync by the Shelf Life app)', public: false, files: { [FILE]: { content: JSON.stringify(state) } } }) });
+    return g.id;
+  }
+  function setSync(status, msg = '') {
+    syncRt.status = status; syncRt.msg = msg;
+    const dot = $('#sync-dot');
+    if (dot) { dot.className = 'sync-dot ' + status; dot.title = syncLine(); }
+    const line = $('#sync-line'); if (line) line.textContent = syncLine();
+  }
+  function syncLine() {
+    const s = syncRt.status;
+    if (s === 'off') return 'Sync is off';
+    if (s === 'busy') return 'Syncing…';
+    if (s === 'error') return syncRt.msg || "Couldn't sync";
+    return sync.last ? 'Synced ' + ago(sync.last) : 'Connected';
+  }
+  function ago(t) {
+    const s = Math.round((Date.now() - t) / 1000);
+    if (s < 45) return 'just now';
+    if (s < 3600) return Math.round(s / 60) + ' min ago';
+    if (s < 86400) return Math.round(s / 3600) + ' h ago';
+    return new Date(t).toLocaleString(undefined, { month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit' });
+  }
+  function scheduleSync(delay = 1500) {
+    if (!sync.token) return;
+    clearTimeout(syncRt.timer);
+    syncRt.timer = setTimeout(runSync, delay);
+  }
+  async function runSync() {
+    if (!sync.token) return;
+    if (syncRt.busy) { syncRt.again = true; return; }
+    syncRt.busy = true; setSync('busy');
+    try {
+      if (!sync.gistId) { sync.gistId = await findOrCreateGist(); saveSync(); }
+      const g = await gh('/gists/' + sync.gistId);
+      const f = g.files && g.files[FILE];
+      let raw = null;
+      if (f) raw = f.truncated ? await (await fetch(f.raw_url, { cache: 'no-store' })).text() : f.content;
+      const before = JSON.stringify(state);
+      if (raw) {
+        let remote = null;
+        try { remote = normalize(JSON.parse(raw)); } catch (e) { remote = null; }
+        if (remote) { state = merge(state, remote); stamp(true); persist(); }
+      }
+      const out = JSON.stringify(state);
+      if (out !== raw) await gh('/gists/' + sync.gistId, { method: 'PATCH', body: JSON.stringify({ files: { [FILE]: { content: out } } }) });
+      sync.last = Date.now(); saveSync(); setSync('idle');
+      if (out !== before) softRender();
+    } catch (e) {
+      if (e.status === 404) { sync.gistId = null; saveSync(); }
+      setSync('error', e.status === 401 ? 'GitHub rejected your token. Reconnect sync with a new one.'
+        : e.status === 403 ? 'GitHub refused the request. Check your token has the "gist" scope.'
+        : e.status === 404 ? 'Your sync gist was not found. It will be recreated on the next sync.'
+        : navigator.onLine === false ? "You're offline. Changes will sync when you're back online." : "Couldn't reach GitHub. Will try again shortly.");
+      if (e.status !== 401 && e.status !== 403) scheduleSync(30000);
+    } finally {
+      syncRt.busy = false;
+      if (syncRt.again) { syncRt.again = false; scheduleSync(300); }
+    }
+  }
+  /* Re-render after a sync without trampling something the person is typing. */
+  function softRender() {
+    const a = document.activeElement;
+    if (a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName) && a.id !== 'q') { ui.stale = true; return; }
+    if (route().name === 'form') { ui.stale = true; return; }
+    render();
+  }
+  document.addEventListener('focusout', () => { if (ui.stale) setTimeout(() => { const a = document.activeElement; if (ui.stale && !(a && /^(INPUT|TEXTAREA|SELECT)$/.test(a.tagName)) && route().name !== 'form') { ui.stale = false; render(); } }, 150); });
+  document.addEventListener('visibilitychange', () => { if (document.visibilityState === 'visible') scheduleSync(200); });
+  window.addEventListener('online', () => scheduleSync(200));
+  setInterval(() => { if (document.visibilityState === 'visible') scheduleSync(0); }, 120000);
+  setInterval(() => { if (syncRt.status === 'idle') setSync('idle'); }, 30000);
+  window.addEventListener('storage', e => { if (e.key === KEY) { state = load(); stamp(true); softRender(); } });
   const byId = id => state.books.find(b => b.id === id);
 
   /* ---------- reading maths ---------- */
@@ -113,13 +265,15 @@
   }
 
   /* ---------- ui state ---------- */
-  const ui = { filter: 'all', logging: null, editGoal: false, editNote: null, confirmDelete: false, confirmClear: false, pendingImport: null, year: new Date().getFullYear(), draft: {} };
+  const ui = { filter: 'all', logging: null, editGoal: false, editNote: null, confirmDelete: false, confirmClear: false, pendingImport: null, year: new Date().getFullYear(), draft: {}, q: '', syncErr: '', stale: false };
   let lastRoute = null;
 
   /* ---------- routing ---------- */
   function route() {
     const h = location.hash.replace(/^#/, '');
     if (h === 'insights') return { name: 'insights' };
+    if (h === 'notes') return { name: 'notes' };
+    if (h === 'sync') return { name: 'sync' };
     if (h === 'add') return { name: 'form' };
     if (h.startsWith('edit-')) return { name: 'form', id: h.slice(5) };
     if (h.startsWith('book-')) return { name: 'book', id: h.slice(5) };
@@ -129,13 +283,17 @@
     const r = route(), key = location.hash;
     if (key !== lastRoute) { ui.logging = null; ui.editNote = null; ui.confirmDelete = false; ui.editGoal = false; ui.confirmClear = false; }
     document.querySelectorAll('[data-nav]').forEach(a => a.classList.toggle('on', a.dataset.nav === r.name));
+    ui.stale = false;
     if (r.name === 'insights') main.innerHTML = viewInsights();
+    else if (r.name === 'notes') main.innerHTML = viewNotes();
+    else if (r.name === 'sync') main.innerHTML = viewSync();
     else if (r.name === 'form') main.innerHTML = viewForm(r.id ? byId(r.id) : null);
     else if (r.name === 'book') { const b = byId(r.id); main.innerHTML = b ? viewBook(b) : viewMissing(); }
     else main.innerHTML = viewHome();
     afterRender(r);
     if (key !== lastRoute) { window.scrollTo(0, 0); lastRoute = key; }
-    const titles = { home: 'Shelf Life', insights: 'Insights · Shelf Life', form: (r.id ? 'Edit book' : 'Add a book') + ' · Shelf Life' };
+    setSync(syncRt.status, syncRt.msg);
+    const titles = { home: 'Shelf Life', insights: 'Insights · Shelf Life', notes: 'Notes · Shelf Life', sync: 'Sync · Shelf Life', form: (r.id ? 'Edit book' : 'Add a book') + ' · Shelf Life' };
     document.title = r.name === 'book' && byId(r.id) ? byId(r.id).title + ' · Shelf Life' : titles[r.name] || 'Shelf Life';
   }
   window.addEventListener('hashchange', render);
@@ -196,7 +354,7 @@
         <button class="link" data-act="export">Export my books</button>
         <label class="link" for="import-file">Import a backup</label>
         <input id="import-file" type="file" accept="application/json,.json" hidden>
-        <span class="mono" style="margin-left:auto">Saved in this browser</span>
+        <a class="mono" style="margin-left:auto" href="#sync">${sync.token ? 'Syncing with GitHub' : 'Saved in this browser · Turn on sync'}</a>
       </section>
       ${ui.pendingImport ? `<div class="confirm" role="alertdialog" aria-label="Confirm import">
         <span>Replace your ${plural(state.books.length, 'book')} with the ${plural(ui.pendingImport.books.length, 'book')} in this backup?</span>
@@ -396,6 +554,86 @@
     }
     save();
     location.hash = 'book-' + b.id;
+  }
+
+  /* ---------- notes (search across every book) ---------- */
+  const reEsc = s => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  function hl(text, terms) {
+    if (!terms.length) return esc(text);
+    const re = new RegExp('(' + terms.map(reEsc).join('|') + ')', 'gi');
+    return String(text).split(re).map((p, i) => i % 2 ? '<mark>' + esc(p) + '</mark>' : esc(p)).join('');
+  }
+  function allNotes() {
+    const out = [];
+    state.books.forEach(b => b.notes.forEach(n => out.push({ b, n })));
+    return out.sort((x, y) => y.n.at.localeCompare(x.n.at) || (y.n.u || 0) - (x.n.u || 0));
+  }
+  function viewNotes() {
+    const all = allNotes(), nBooks = new Set(all.map(x => x.b.id)).size;
+    return `
+      <div class="yearseg"><h3>Notes</h3><span class="mono">${plural(all.length, 'note')}${all.length ? ' from ' + plural(nBooks, 'book') : ''}</span></div>
+      <div class="search">
+        <label class="sr" for="q">Search notes</label>
+        <input id="q" type="search" placeholder="Search your notes, titles and authors" value="${esc(ui.q)}" autocomplete="off" spellcheck="false">
+      </div>
+      <section class="notes wide" id="note-results" aria-live="polite">${noteResults()}</section>`;
+  }
+  function noteResults() {
+    const terms = ui.q.trim().toLowerCase().split(/\s+/).filter(Boolean), all = allNotes();
+    if (!all.length) return `<p class="no-notes">No notes yet. Open a book and add one while you read.</p>`;
+    const hits = all.filter(({ b, n }) => { const hay = (n.text + ' ' + b.title + ' ' + b.author).toLowerCase(); return terms.every(t => hay.includes(t)); });
+    if (!hits.length) return `<p class="no-notes">No notes match “${esc(ui.q.trim())}”.</p>`;
+    return (terms.length ? `<span class="mono count">${plural(hits.length, 'match', 'matches')}</span>` : '') + hits.map(({ b, n }) => `
+      <article class="note">
+        <div class="note-h"><a class="nb" href="#book-${esc(b.id)}">${hl(b.title, terms)}${b.author ? ` <span>· ${hl(b.author, terms)}</span>` : ''}</a><span class="mono">${n.page ? 'p. ' + n.page + ' · ' : ''}${fmtD(n.at)}</span></div>
+        <p>${hl(n.text, terms)}</p>
+      </article>`).join('');
+  }
+
+  /* ---------- sync settings ---------- */
+  function viewSync() {
+    const tokenUrl = 'https://github.com/settings/tokens/new?scopes=gist&description=Shelf%20Life%20sync';
+    if (!sync.token) return `
+      <div class="yearseg"><h3>Sync across devices</h3></div>
+      <div class="prose">
+        <p>Keep the same shelf, notes and reading log on your phone and laptop. Your library is saved as a private file (a secret gist) in your own GitHub account. Each device you connect stays in step with it.</p>
+        <ol class="steps">
+          <li><b>Create a token.</b> <a href="${tokenUrl}" target="_blank" rel="noopener">Open GitHub's token page</a>. The name and the <b>gist</b> permission are already filled in. Choose an expiry (a year is sensible), then press <b>Generate token</b> and copy it.</li>
+          <li><b>Paste it below</b> and press Connect. Do the same on each device. You can reuse the token or make one per device.</li>
+        </ol>
+        <form class="connect" data-form="sync-connect">
+          <label class="sr" for="tok">GitHub token</label>
+          <input id="tok" type="password" placeholder="ghp_…" autocomplete="off" spellcheck="false" required>
+          <button class="btn primary">Connect</button>
+        </form>
+        ${ui.syncErr ? `<p class="err" role="alert">${esc(ui.syncErr)}</p>` : ''}
+        <p class="fine">The token stays in this browser and is only ever sent to GitHub. It can read and write your gists and nothing else. If you already have books on this device, they're combined with what's already synced. Nothing is overwritten.</p>
+      </div>`;
+    return `
+      <div class="yearseg"><h3>Sync across devices</h3></div>
+      <div class="prose">
+        <div class="sync-card">
+          <span class="sync-dot ${syncRt.status}" aria-hidden="true"></span>
+          <div><b id="sync-line">${esc(syncLine())}</b>
+            <div class="mono">${sync.login ? 'GitHub account ' + esc(sync.login) + ' · ' : ''}${sync.gistId ? `<a href="https://gist.github.com/${esc(sync.gistId)}" target="_blank" rel="noopener">View the sync file</a>` : 'Setting up…'}</div></div>
+        </div>
+        <p>Changes save to GitHub a moment after you make them. Other devices pick them up when you open the app, or every couple of minutes while it's open.</p>
+        <div class="form-foot"><button class="btn primary" data-act="sync-now">Sync now</button><button class="btn" data-act="sync-off">Disconnect this device</button></div>
+        <p class="fine">Disconnecting removes the token from this browser only. Your books stay here, and the copy on GitHub stays as it is.</p>
+      </div>`;
+  }
+  async function connectSync(token) {
+    sync = { token: token.trim() }; setSync('busy');
+    try {
+      const me = await gh('/user');
+      sync.login = me && me.login; saveSync();
+      await runSync();
+      if (syncRt.status !== 'error') toast('Sync is on');
+    } catch (e) {
+      sync = {}; saveSync(); setSync('off');
+      ui.syncErr = e.status === 401 ? "GitHub didn't accept that token. Check you copied all of it." : "Couldn't reach GitHub. Check your connection and try again.";
+    }
+    render();
   }
 
   /* ---------- insights ---------- */
@@ -602,7 +840,9 @@
         state.books = kept; save(); toast('Examples removed', 'Undo', () => { state.books = [...state.books, ...gone]; save(); render(); }); }
         break;
       case 'export': exportData(); return;
-      case 'import-yes': if (ui.pendingImport) { state = ui.pendingImport; ui.pendingImport = null; save(); toast(`Imported ${plural(state.books.length, 'book')}`); } break;
+      case 'import-yes': if (ui.pendingImport) { importNow(); } break;
+      case 'sync-now': ui.syncErr = ''; runSync(); return;
+      case 'sync-off': sync = {}; saveSync(); clearTimeout(syncRt.timer); setSync('off'); toast('Sync turned off on this device'); break;
       case 'import-no': ui.pendingImport = null; break;
       default: return;
     }
@@ -613,6 +853,7 @@
     e.preventDefault();
     const b = form.dataset.id ? byId(form.dataset.id) : null;
     if (kind === 'book') return submitBook(form);
+    if (kind === 'sync-connect') { const t = $('#tok').value.trim(); if (t) { ui.syncErr = ''; form.querySelector('button').disabled = true; form.querySelector('button').textContent = 'Connecting…'; connectSync(t); } return; }
     if (kind === 'goal') { const v = parseInt($('#goal-in').value, 10); if (v >= 1) { state.goal = Math.min(999, v); save(); } ui.editGoal = false; }
     if (kind === 'log' && b) {
       const input = form.querySelector('input'), v = parseInt(input.value, 10);
@@ -636,6 +877,7 @@
   });
   document.addEventListener('input', e => {
     if (e.target.id === 'note-text') { const f = e.target.closest('form'); if (f) ui.draft[f.dataset.id] = e.target.value; }
+    if (e.target.id === 'q') { ui.q = e.target.value; const r = $('#note-results'); if (r) r.innerHTML = noteResults(); }
   });
   document.addEventListener('change', e => {
     if (e.target.id !== 'import-file' || !e.target.files[0]) return;
@@ -645,7 +887,7 @@
         const data = JSON.parse(rd.result);
         if (!data || !Array.isArray(data.books)) throw new Error('shape');
         ui.pendingImport = normalize(data);
-        if (!state.books.length) { state = ui.pendingImport; ui.pendingImport = null; save(); toast(`Imported ${plural(state.books.length, 'book')}`); }
+        if (!state.books.length) importNow();
       } catch (err) { toast("That file isn't a Shelf Life backup."); }
       render();
     };
@@ -653,6 +895,13 @@
   });
   document.addEventListener('keydown', e => { if (e.key === 'Escape' && ui.logging) { ui.logging = null; render(); } });
 
+  function importNow() {
+    const next = ui.pendingImport; ui.pendingImport = null;
+    next.tomb = { ...state.tomb, ...next.tomb };
+    next.books.forEach(b => { b.u = 0; b.notes.forEach(n => { n.u = 0; }); });
+    state = next; save();
+    toast(`Imported ${plural(state.books.length, 'book')}`);
+  }
   function exportData() {
     const blob = new Blob([JSON.stringify(state, null, 2)], { type: 'application/json' });
     const a = document.createElement('a');
@@ -728,4 +977,5 @@
   }
 
   render();
+  if (sync.token) scheduleSync(0);
 })();
