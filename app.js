@@ -978,4 +978,7 @@
 
   render();
   if (sync.token) scheduleSync(0);
+  if ('serviceWorker' in navigator && (location.protocol === 'https:' || location.hostname === 'localhost')) {
+    navigator.serviceWorker.register('sw.js').catch(() => { /* app still works without it */ });
+  }
 })();
